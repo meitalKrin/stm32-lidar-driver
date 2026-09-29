@@ -1,0 +1,11 @@
+build/
+cmake-build-*/
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+.cache/
+compile_commands.json
+.vscode/
