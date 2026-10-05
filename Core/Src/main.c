@@ -18,7 +18,7 @@
      */
 
 #include "stm32f411xe.h"
-uint32_t SystemCoreClock = 16000000;   // HSI after reset; set to 100 MHz in main
+  uint32_t SystemCoreClock = 16000000;     // HSI after reset; set to 100 MHz 
 void SystemInit(void) { }
 
 int main(void) {
@@ -26,7 +26,17 @@ int main(void) {
     //RCC_AHB1ENR_GPIOAEN Behind the scenes,
     //  it simply represents 1u << 0 (bit 0), which is the exact switch for Port A.
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
-    
+    //Set PA8 to alternate function
+    GPIOA->MODER &= ~(3U << 16);
+    GPIOA->MODER |=  (2U << 16);
+      //Output the PLL clock on PA8
+    RCC->CFGR &= ~(RCC_CFGR_MCO1 | RCC_CFGR_MCO1PRE);
+    RCC->CFGR |=  (RCC_CFGR_MCO1 | RCC_CFGR_MCO1PRE);
+     // PA8 = AF0 (MCO1), very high speed
+    GPIOA->MODER   &= ~(3U << 16);
+    GPIOA->MODER   |=  (2U << 16);
+    GPIOA->AFR[1]  &= ~(0xFU << 0);    // AF0
+    GPIOA->OSPEEDR |=  (3U << 16);
     // pin A5 reset wiping whatever job Pin 5 had before and then Output Mode in the second line
     GPIOA->MODER &= ~(3u << 10);
     GPIOA->MODER |=  (1u << 10);
@@ -74,8 +84,16 @@ int main(void) {
     RCC->CFGR |= RCC_CFGR_SW_PLL;
     //wait for flag confirming that the CPU is now successfully running at 100 MHz.
     while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL);
+    SystemCoreClock = 100000000;
 
-   
+
+ 
+ 
+
+
+
+
+
 
    while (1) {
     // BLINK LED TEST
