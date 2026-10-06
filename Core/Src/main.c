@@ -19,8 +19,7 @@
 
 #include "stm32f411xe.h"
 #include <stdio.h>
-  uint32_t SystemCoreClock = 16000000;     // HSI after reset; set to 100 MHz 
-
+uint32_t SystemCoreClock = 16000000;     // HSI after reset; set to 100 MHz 
 void SystemInit(void) { }
 int _write(int fd, char *buf, int len){
   (void)fd;
@@ -30,6 +29,13 @@ int _write(int fd, char *buf, int len){
   }
   return len;
 };
+
+void delay_us(uint32_t us)
+{
+  uint32_t  cycles = us * (SystemCoreClock/1000000);
+  uint32_t start = DWT -> CYCCNT;
+  while((DWT -> CYCCNT-start)<cycles);
+}
 int main(void) {
     //**start with PINS**//
     //wakes up Port A so we can use it
@@ -109,17 +115,16 @@ int main(void) {
      USART2->CR1 |= (1u << 13);
      USART2->CR1  &= ~(USART_CR1_TE);
      USART2->CR1  |= (1u << 3);
-
+     //
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
     SystemCoreClock = 100000000;
-    printf("hello\n");
-
- 
- 
 
 
-
-
-
+    printf("start\n");
+    delay_us(1000000);      
+    printf("1 second\n");
 
    while (1) {
     // BLINK LED TEST
