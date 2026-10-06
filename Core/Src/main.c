@@ -18,10 +18,20 @@
      */
 
 #include "stm32f411xe.h"
+#include <stdio.h>
   uint32_t SystemCoreClock = 16000000;     // HSI after reset; set to 100 MHz 
-void SystemInit(void) { }
 
+void SystemInit(void) { }
+int _write(int fd, char *buf, int len){
+  (void)fd;
+  for (int i =0; i<len; i++){
+    while(!(USART2->SR & USART_SR_TXE));
+    USART2->DR = (uint8_t)buf[i];
+  }
+  return len;
+};
 int main(void) {
+    //**start with PINS**//
     //wakes up Port A so we can use it
     //RCC_AHB1ENR_GPIOAEN Behind the scenes,
     //  it simply represents 1u << 0 (bit 0), which is the exact switch for Port A.
@@ -37,6 +47,11 @@ int main(void) {
     GPIOA->MODER   |=  (2U << 16);
     GPIOA->AFR[1]  &= ~(0xFU << 0);    // AF0
     GPIOA->OSPEEDR |=  (3U << 16);
+    //Set PA2 to alternate function AF7
+     GPIOA->MODER &= ~(3U << 4);
+     GPIOA->MODER |= (2U << 4);
+      GPIOA->AFR[0]  &= ~(0xFU << 8);  
+      GPIOA->AFR[0] |= (7U   << 8);
     // pin A5 reset wiping whatever job Pin 5 had before and then Output Mode in the second line
     GPIOA->MODER &= ~(3u << 10);
     GPIOA->MODER |=  (1u << 10);
@@ -84,8 +99,19 @@ int main(void) {
     RCC->CFGR |= RCC_CFGR_SW_PLL;
     //wait for flag confirming that the CPU is now successfully running at 100 MHz.
     while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL);
-    SystemCoreClock = 100000000;
+    //Enable the USART2 clock
+    RCC->APB1ENR |=(1u << 17);
+    (void)RCC->APB1ENR; 
+    //Set the baud rate to 115200. 
+    USART2->BRR = 0x1B2;
+    //Enable TE and UE in CR1.
+     USART2->CR1  &= ~(USART_CR1_UE);
+     USART2->CR1 |= (1u << 13);
+     USART2->CR1  &= ~(USART_CR1_TE);
+     USART2->CR1  |= (1u << 3);
 
+    SystemCoreClock = 100000000;
+    printf("hello\n");
 
  
  

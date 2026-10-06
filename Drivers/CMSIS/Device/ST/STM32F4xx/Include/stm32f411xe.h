@@ -8235,7 +8235,7 @@ typedef struct
 #define USB_OTG_CHNUM_3                          (0x8UL << USB_OTG_CHNUM_Pos)   /*!< 0x00000008 */
 #define USB_OTG_BCNT_Pos                         (4U)
 #define USB_OTG_BCNT_Msk                         (0x7FFUL << USB_OTG_BCNT_Pos)  /*!< 0x00007FF0 */
-#define USB_OTG_BCNT                             USB_OTG_BCNT_Msk              /*!< Byte count */
+#define USB_OTG_BCNT                             USB_OTG_BCNT_Msk              /*!< By_CR1)count */
 
 #define USB_OTG_DPID_Pos                         (15U)
 #define USB_OTG_DPID_Msk                         (0x3UL << USB_OTG_DPID_Pos)    /*!< 0x00018000 */
