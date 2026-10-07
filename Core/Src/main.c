@@ -21,6 +21,32 @@
 #include <stdio.h>
 uint32_t SystemCoreClock = 16000000;     // HSI after reset; set to 100 MHz 
 void SystemInit(void) { }
+uint8_t crc_table[256];
+void crc8_init(void){
+ for (int i = 0; i<256;i++){
+    uint8_t crc = i;
+     for (int j = 0; j < 8; j++){
+        if(crc & 0x80){
+            crc = (crc << 1) ^ 0x4D;
+        }else{
+             crc = crc << 1;
+        }
+       
+     }
+      crc_table[i] = crc;
+ }
+
+}
+
+
+uint8_t crc8(const uint8_t *data, int len)
+{
+    uint8_t crc = 0;
+    for (int i = 0; i < len; i++) {
+        crc = crc_table[crc ^ data[i]];
+    }
+    return crc;
+}
 int _write(int fd, char *buf, int len){
   (void)fd;
   for (int i =0; i<len; i++){
@@ -29,7 +55,15 @@ int _write(int fd, char *buf, int len){
   }
   return len;
 };
-
+uint8_t uart1_getc(void)
+{
+    while (!(USART1->SR & USART_SR_RXNE));
+    return USART1->DR;
+}
+uint16_t u16le(const uint8_t *p)
+{
+    return p[0] | (p[1] << 8);  
+}
 void delay_us(uint32_t us)
 {
   uint32_t  cycles = us * (SystemCoreClock/1000000);
@@ -136,19 +170,48 @@ int main(void) {
   USART1->BRR = 0x1B2;    
     USART1->CR1 |= USART_CR1_RE | USART_CR1_UE;
 
+    
 
       SystemCoreClock = 100000000;
       setvbuf(stdout, NULL, _IONBF, 0);
-      printf("boot\n");   
-uint8_t buf[100];
+      printf("boot\n");  
+    
+crc8_init();
+
 while (1) {
-    for (int i = 0; i < 100; i++) {
-        while (!(USART1->SR & USART_SR_RXNE));
-        buf[i] = USART1->DR;
+    uint8_t pkt[47];
+
+
+    if (uart1_getc() != 0x54) continue;
+    if (uart1_getc() != 0x2C) continue;
+    pkt[0] = 0x54;
+    pkt[1] = 0x2C;
+
+    //
+    for (int i = 2; i < 47; i++)
+        pkt[i] = uart1_getc();
+
+    // 
+    if (crc8(pkt, 46) != pkt[46]) {
+        printf("CRC FAIL\n");
+        continue;
     }
-    for (int i = 0; i < 100; i++) {
-        printf("%02X ", buf[i]);
+
+    // 
+    uint16_t speed = u16le(&pkt[2]);   
+    uint16_t start = u16le(&pkt[4]);    
+    uint16_t end   = u16le(&pkt[42]);   
+
+    // 
+    if (start > 1000) continue;
+
+    printf("spd=%u start=%u.%02u end=%u.%02u | ",
+           speed, start / 100, start % 100, end / 100, end % 100);
+
+    for (int k = 0; k < 12; k++) {
+        uint16_t dist = u16le(&pkt[6 + 3 * k]);  
+        printf("%u ", dist);
     }
-    printf("\n\n");
+    printf("\n");
 }
 }
