@@ -58,6 +58,16 @@ int main(void) {
      GPIOA->MODER |= (2U << 4);
       GPIOA->AFR[0]  &= ~(0xFU << 8);  
       GPIOA->AFR[0] |= (7U   << 8);
+    //set PA10 
+     GPIOA->MODER   &= ~(3U << 20);
+      GPIOA->MODER  |=  (2U << 20);
+      GPIOA->AFR[1] &= ~(0xFU << 8);
+      GPIOA->AFR[1] |=  (7U   << 8);
+
+      GPIOA->PUPDR &= ~(3U << 20);
+      GPIOA->PUPDR |=  (1U << 20);
+
+
     // pin A5 reset wiping whatever job Pin 5 had before and then Output Mode in the second line
     GPIOA->MODER &= ~(3u << 10);
     GPIOA->MODER |=  (1u << 10);
@@ -119,18 +129,26 @@ int main(void) {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-    SystemCoreClock = 100000000;
+  
+    //Clock for USART1 (APB2)
+  RCC->APB2ENR |= RCC_APB2ENR_USART1EN;
+  (void)RCC->APB2ENR;
+  USART1->BRR = 0x1B2;    
+    USART1->CR1 |= USART_CR1_RE | USART_CR1_UE;
 
 
-    printf("start\n");
-    delay_us(1000000);      
-    printf("1 second\n");
-
-   while (1) {
-    // BLINK LED TEST
-    GPIOA->ODR |= (1u << 5);        
-    for (volatile int i = 0; i < 400000; i++);
-    GPIOA->ODR &= ~(1u << 5);       
-    for (volatile int i = 0; i < 400000; i++);
+      SystemCoreClock = 100000000;
+      setvbuf(stdout, NULL, _IONBF, 0);
+      printf("boot\n");   
+uint8_t buf[100];
+while (1) {
+    for (int i = 0; i < 100; i++) {
+        while (!(USART1->SR & USART_SR_RXNE));
+        buf[i] = USART1->DR;
     }
+    for (int i = 0; i < 100; i++) {
+        printf("%02X ", buf[i]);
+    }
+    printf("\n\n");
+}
 }
