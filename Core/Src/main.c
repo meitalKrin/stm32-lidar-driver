@@ -29,16 +29,6 @@
 #include "stm32f411xe.h"
 #include <stdio.h>
 
-/* Phase 2.3 starvation test switches
- * STARVE_MODE 0 : normal run
- * STARVE_MODE 1 : main blocks ALL interrupts for STARVE_US every STARVE_PERIOD_MS
- * STARVE_MODE 2 : SysTick (priority 0, above USART1) busy-waits SYSTICK_BUSY_US every 1 ms
- */
-#define STARVE_MODE        0
-#define STARVE_US          200u
-#define STARVE_PERIOD_MS   10u
-#define SYSTICK_BUSY_US    100u
-
 uint8_t  buf[RB_SIZE];
 volatile uint32_t head = 0;
 volatile uint32_t tail = 0;
@@ -131,39 +121,95 @@ void delay_us(uint32_t us)
   while((DWT -> CYCCNT-start)<cycles);
 }
 
-#if STARVE_MODE == 2
-void SysTick_Handler(void) {
-    delay_us(SYSTICK_BUSY_US);
-}
-#endif
+/* ==================== Phase 2.3: starvation experiment ==================== */
 
-static const uint32_t ONE_SEC = 100000000u;
-static uint32_t last_stats;
-static uint32_t last_ok;
-#if STARVE_MODE == 1
-static uint32_t last_starve;
-#endif
+#define TEST_SECONDS 5u
+static const uint32_t ONE_SEC = 100000000u;     // cycles at 100 MHz
+
+enum { LOAD_NONE = 0, LOAD_IRQ_OFF = 1, LOAD_SYSTICK = 2 };
+
+typedef struct {
+    const char *name;
+    uint8_t     load;        // LOAD_NONE / LOAD_IRQ_OFF / LOAD_SYSTICK
+    uint32_t    busy_us;     // how long the CPU is blocked each time
+    uint32_t    period_ms;   // how often it happens
+} test_t;
+
+static const test_t tests[] = {
+    { "baseline",            LOAD_NONE,      0,  0 },
+    { "irq-off 200us / 20ms", LOAD_IRQ_OFF, 200, 20 },
+    { "irq-off 200us / 10ms", LOAD_IRQ_OFF, 200, 10 },
+    { "irq-off 200us /  5ms", LOAD_IRQ_OFF, 200,  5 },
+    { "irq-off 200us /  2ms", LOAD_IRQ_OFF, 200,  2 },
+    { "irq-off  30us /  2ms", LOAD_IRQ_OFF,  30,  2 },
+    { "systick 100us /  1ms", LOAD_SYSTICK, 100,  1 },
+    { "systick  30us /  1ms", LOAD_SYSTICK,  30,  1 },
+};
+#define N_TESTS (sizeof(tests) / sizeof(tests[0]))
+
+volatile uint32_t systick_busy_us = 0;
+
+void SysTick_Handler(void) {
+    delay_us(systick_busy_us);
+}
+
+static uint32_t cur_test = 0;
+static uint32_t test_start;
+static uint32_t last_load;
+static uint32_t snap_ok, snap_crc, snap_ore, snap_fe, snap_ovf;
+
+static void start_test(uint32_t i) {
+    const test_t *t = &tests[i];
+
+    SysTick->CTRL = 0;                          // stop any previous SysTick load
+    if (t->load == LOAD_SYSTICK) {
+        systick_busy_us = t->busy_us;
+        SysTick_Config(t->period_ms * 100000u);
+        NVIC_SetPriority(SysTick_IRQn, 0);      // AFTER SysTick_Config (it sets the lowest)
+    }
+
+    snap_ok  = packets_ok;
+    snap_crc = crc_fail_count;
+    snap_ore = ore_count;
+    snap_fe  = fe_count;
+    snap_ovf = rb_overflow_count;
+
+    test_start = DWT->CYCCNT;
+    last_load  = test_start;
+}
+
+static void end_test(uint32_t i) {
+    printf("%-22s pkt/s=%3lu crc/s=%3lu ore/s=%3lu fe=%lu ovf=%lu\n",
+           tests[i].name,
+           (unsigned long)((packets_ok        - snap_ok)  / TEST_SECONDS),
+           (unsigned long)((crc_fail_count    - snap_crc) / TEST_SECONDS),
+           (unsigned long)((ore_count         - snap_ore) / TEST_SECONDS),
+           (unsigned long)(fe_count           - snap_fe),
+           (unsigned long)(rb_overflow_count  - snap_ovf));
+}
 
 static void background(void) {
-    if ((DWT->CYCCNT - last_stats) >= ONE_SEC) {
-        last_stats += ONE_SEC;
-        printf("pkt/s=%lu crc=%lu ore=%lu fe=%lu ovf=%lu\n",
-               (unsigned long)(packets_ok - last_ok),
-               (unsigned long)crc_fail_count,
-               (unsigned long)ore_count,
-               (unsigned long)fe_count,
-               (unsigned long)rb_overflow_count);
-        last_ok = packets_ok;
-    }
+    if (cur_test >= N_TESTS) return;            // all tests finished
+    const test_t *t = &tests[cur_test];
 
-#if STARVE_MODE == 1
-    if ((DWT->CYCCNT - last_starve) >= STARVE_PERIOD_MS * 100000u) {
-        last_starve += STARVE_PERIOD_MS * 100000u;
+    if (t->load == LOAD_IRQ_OFF &&
+        (DWT->CYCCNT - last_load) >= t->period_ms * 100000u) {
+        last_load += t->period_ms * 100000u;
         __disable_irq();
-        delay_us(STARVE_US);
+        delay_us(t->busy_us);
         __enable_irq();
     }
-#endif
+
+    if ((DWT->CYCCNT - test_start) >= TEST_SECONDS * ONE_SEC) {
+        end_test(cur_test);
+        cur_test++;
+        if (cur_test < N_TESTS) {
+            start_test(cur_test);
+        } else {
+            SysTick->CTRL = 0;
+            printf("done\n");
+        }
+    }
 }
 
 uint8_t rb_getc(void) {
@@ -278,7 +324,6 @@ int main(void) {
       SystemCoreClock = 100000000;
       setvbuf(stdout, NULL, _IONBF, 0);
       printf("boot\n");  
-      printf("STARVE_MODE=%d\n", STARVE_MODE);
     
 crc8_init();
 
@@ -289,16 +334,8 @@ crc8_init();
     USART1->CR1 |= USART_CR1_RXNEIE;
     NVIC_EnableIRQ(USART1_IRQn);
 
-#if STARVE_MODE == 2
-    SysTick_Config(100000);
-    NVIC_SetPriority(SysTick_IRQn, 0);
-#endif
-
-    last_stats = DWT->CYCCNT;
-    last_ok = 0;
-#if STARVE_MODE == 1
-    last_starve = DWT->CYCCNT;
-#endif
+    printf("starvation test: %u s per row\n", (unsigned)TEST_SECONDS);
+    start_test(0);
 
 while (1) {
     uint8_t pkt[47];
