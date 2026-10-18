@@ -15,13 +15,30 @@
      * 2. ICEN & DCEN (Caches): Tiny, super-fast memory that saves a copy of 
      *    recently run code. Since our LED blinks in a repeating while(1) loop, 
      *    the CPU runs it directly from this fast cache instead of the slow Flash.
-     */
-
+    
+      * Receive Buffer Size Calculation (256 bytes):
+      * - 115200 baud ÷ 10 bits/char = 11,520 characters/sec.
+      * - A 60-character line takes ~5.2 ms (60 / 11,520).
+      * - During that window, 5.2 ms ÷ 43.4 µs ≈ 120 bytes arrive.
+      * - Doubled for safety margin = 240 bytes.
+       * - Next power of two = 256 bytes.
+      */
+    
+#define RB_SIZE 256u
+#define RB_MASK (RB_SIZE - 1u)
 #include "stm32f411xe.h"
 #include <stdio.h>
+uint8_t  buf[RB_SIZE];
+   volatile uint32_t head = 0;
+   volatile uint32_t tail = 0;
+
+   volatile uint32_t ore_count = 0;
+   volatile uint32_t rb_overflow_count = 0; 
 uint32_t SystemCoreClock = 16000000;     // HSI after reset; set to 100 MHz 
 void SystemInit(void) { }
 uint8_t crc_table[256];
+// turn on interupts 
+
 void crc8_init(void){
  for (int i = 0; i<256;i++){
     uint8_t crc = i;
@@ -47,14 +64,51 @@ uint8_t crc8(const uint8_t *data, int len)
     }
     return crc;
 }
-int _write(int fd, char *buf, int len){
-  (void)fd;
-  for (int i =0; i<len; i++){
-    while(!(USART2->SR & USART_SR_TXE));
-    USART2->DR = (uint8_t)buf[i];
-  }
-  return len;
-};
+
+int rb_put( uint8_t b) {
+    uint32_t next = (head + 1) & RB_MASK;
+    if (next == tail) {
+        return 0;         
+    }
+    buf[head] = b;         
+    head = next;        
+    return 1;
+}
+int rb_get( uint8_t *out) {
+    if (head == tail) {
+        return 0;                     
+    }
+    *out = buf[tail];                  
+    tail = (tail + 1) & RB_MASK;       
+    return 1;
+}
+void USART1_IRQHandler(void) {
+    uint32_t sr = USART1->SR;                     
+
+    if (sr & (USART_SR_RXNE | USART_SR_ORE)) {
+        uint8_t b = (uint8_t)USART1->DR;          
+        if (sr & USART_SR_ORE) {
+            ore_count++;                          
+        }
+        if (!rb_put(b)) {
+            rb_overflow_count++;               
+        }
+    }
+}
+
+
+int _write(int fd, char *ptr, int len) {
+    (void)fd;
+    for (int i = 0; i < len; i++) {
+        if (ptr[i] == '\n') {                      
+            while (!(USART2->SR & USART_SR_TXE));
+            USART2->DR = '\r';                     
+        }
+        while (!(USART2->SR & USART_SR_TXE));
+        USART2->DR = (uint8_t)ptr[i];
+    }
+    return len;
+}
 uint8_t uart1_getc(void)
 {
     while (!(USART1->SR & USART_SR_RXNE));
@@ -69,6 +123,12 @@ void delay_us(uint32_t us)
   uint32_t  cycles = us * (SystemCoreClock/1000000);
   uint32_t start = DWT -> CYCCNT;
   while((DWT -> CYCCNT-start)<cycles);
+}
+
+uint8_t rb_getc(void) {
+    uint8_t b;
+    while (!rb_get(&b)) { }  
+    return b;
 }
 int main(void) {
     //**start with PINS**//
@@ -178,18 +238,24 @@ int main(void) {
     
 crc8_init();
 
+
+   (void)USART1->SR;                  
+    (void)USART1->DR;
+    NVIC_SetPriority(USART1_IRQn, 1);
+    USART1->CR1 |= USART_CR1_RXNEIE;
+    NVIC_EnableIRQ(USART1_IRQn);
 while (1) {
     uint8_t pkt[47];
+  
 
-
-    if (uart1_getc() != 0x54) continue;
-    if (uart1_getc() != 0x2C) continue;
+    if (rb_getc() != 0x54) continue;
+    if (rb_getc() != 0x2C) continue;
     pkt[0] = 0x54;
     pkt[1] = 0x2C;
 
     //
     for (int i = 2; i < 47; i++)
-        pkt[i] = uart1_getc();
+        pkt[i] = rb_getc();
 
     // 
     if (crc8(pkt, 46) != pkt[46]) {
