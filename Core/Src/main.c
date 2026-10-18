@@ -28,16 +28,28 @@
 #define RB_MASK (RB_SIZE - 1u)
 #include "stm32f411xe.h"
 #include <stdio.h>
-uint8_t  buf[RB_SIZE];
-   volatile uint32_t head = 0;
-   volatile uint32_t tail = 0;
 
-   volatile uint32_t ore_count = 0;
-   volatile uint32_t rb_overflow_count = 0; 
+/* Phase 2.3 starvation test switches
+ * STARVE_MODE 0 : normal run
+ * STARVE_MODE 1 : main blocks ALL interrupts for STARVE_US every STARVE_PERIOD_MS
+ * STARVE_MODE 2 : SysTick (priority 0, above USART1) busy-waits SYSTICK_BUSY_US every 1 ms
+ */
+#define STARVE_MODE        0
+#define STARVE_US          200u
+#define STARVE_PERIOD_MS   10u
+#define SYSTICK_BUSY_US    100u
+
+uint8_t  buf[RB_SIZE];
+volatile uint32_t head = 0;
+volatile uint32_t tail = 0;
+volatile uint32_t ore_count = 0;          
+volatile uint32_t rb_overflow_count = 0;  
+volatile uint32_t fe_count = 0;           
+uint32_t packets_ok = 0;                  
+uint32_t crc_fail_count = 0;
 uint32_t SystemCoreClock = 16000000;     // HSI after reset; set to 100 MHz 
 void SystemInit(void) { }
 uint8_t crc_table[256];
-// turn on interupts 
 
 void crc8_init(void){
  for (int i = 0; i<256;i++){
@@ -82,17 +94,16 @@ int rb_get( uint8_t *out) {
     tail = (tail + 1) & RB_MASK;       
     return 1;
 }
+// turn on interupts 
 void USART1_IRQHandler(void) {
-    uint32_t sr = USART1->SR;                     
+    uint32_t sr = USART1->SR;
 
     if (sr & (USART_SR_RXNE | USART_SR_ORE)) {
-        uint8_t b = (uint8_t)USART1->DR;          
-        if (sr & USART_SR_ORE) {
-            ore_count++;                          
-        }
-        if (!rb_put(b)) {
-            rb_overflow_count++;               
-        }
+        uint8_t b = (uint8_t)USART1->DR;      
+
+        if (sr & USART_SR_ORE) ore_count++;
+        if (sr & USART_SR_FE)  fe_count++;
+        if (!rb_put(b))        rb_overflow_count++;
     }
 }
 
@@ -109,11 +120,6 @@ int _write(int fd, char *ptr, int len) {
     }
     return len;
 }
-uint8_t uart1_getc(void)
-{
-    while (!(USART1->SR & USART_SR_RXNE));
-    return USART1->DR;
-}
 uint16_t u16le(const uint8_t *p)
 {
     return p[0] | (p[1] << 8);  
@@ -125,9 +131,46 @@ void delay_us(uint32_t us)
   while((DWT -> CYCCNT-start)<cycles);
 }
 
+#if STARVE_MODE == 2
+void SysTick_Handler(void) {
+    delay_us(SYSTICK_BUSY_US);
+}
+#endif
+
+static const uint32_t ONE_SEC = 100000000u;
+static uint32_t last_stats;
+static uint32_t last_ok;
+#if STARVE_MODE == 1
+static uint32_t last_starve;
+#endif
+
+static void background(void) {
+    if ((DWT->CYCCNT - last_stats) >= ONE_SEC) {
+        last_stats += ONE_SEC;
+        printf("pkt/s=%lu crc=%lu ore=%lu fe=%lu ovf=%lu\n",
+               (unsigned long)(packets_ok - last_ok),
+               (unsigned long)crc_fail_count,
+               (unsigned long)ore_count,
+               (unsigned long)fe_count,
+               (unsigned long)rb_overflow_count);
+        last_ok = packets_ok;
+    }
+
+#if STARVE_MODE == 1
+    if ((DWT->CYCCNT - last_starve) >= STARVE_PERIOD_MS * 100000u) {
+        last_starve += STARVE_PERIOD_MS * 100000u;
+        __disable_irq();
+        delay_us(STARVE_US);
+        __enable_irq();
+    }
+#endif
+}
+
 uint8_t rb_getc(void) {
     uint8_t b;
-    while (!rb_get(&b)) { }  
+    while (!rb_get(&b)) {
+        background();
+    }
     return b;
 }
 int main(void) {
@@ -235,6 +278,7 @@ int main(void) {
       SystemCoreClock = 100000000;
       setvbuf(stdout, NULL, _IONBF, 0);
       printf("boot\n");  
+      printf("STARVE_MODE=%d\n", STARVE_MODE);
     
 crc8_init();
 
@@ -244,6 +288,18 @@ crc8_init();
     NVIC_SetPriority(USART1_IRQn, 1);
     USART1->CR1 |= USART_CR1_RXNEIE;
     NVIC_EnableIRQ(USART1_IRQn);
+
+#if STARVE_MODE == 2
+    SysTick_Config(100000);
+    NVIC_SetPriority(SysTick_IRQn, 0);
+#endif
+
+    last_stats = DWT->CYCCNT;
+    last_ok = 0;
+#if STARVE_MODE == 1
+    last_starve = DWT->CYCCNT;
+#endif
+
 while (1) {
     uint8_t pkt[47];
   
@@ -259,25 +315,9 @@ while (1) {
 
     // 
     if (crc8(pkt, 46) != pkt[46]) {
-        printf("CRC FAIL\n");
+        crc_fail_count++;
         continue;
     }
-
-    // 
-    uint16_t speed = u16le(&pkt[2]);   
-    uint16_t start = u16le(&pkt[4]);    
-    uint16_t end   = u16le(&pkt[42]);   
-
-    // 
-    if (start > 1000) continue;
-
-    printf("spd=%u start=%u.%02u end=%u.%02u | ",
-           speed, start / 100, start % 100, end / 100, end % 100);
-
-    for (int k = 0; k < 12; k++) {
-        uint16_t dist = u16le(&pkt[6 + 3 * k]);  
-        printf("%u ", dist);
-    }
-    printf("\n");
+    packets_ok++;
 }
 }
