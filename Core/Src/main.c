@@ -22,6 +22,9 @@
       * - During that window, 5.2 ms ÷ 43.4 µs ≈ 120 bytes arrive.
       * - Doubled for safety margin = 240 bytes.
        * - Next power of two = 256 bytes.
+       * - 512= 256 X2
+
+       in RWM  no need for &= IN one bit
       */
     
 #define RB_SIZE 256u
@@ -34,12 +37,17 @@ volatile uint32_t head = 0;
 volatile uint32_t tail = 0;
 volatile uint32_t ore_count = 0;          
 volatile uint32_t rb_overflow_count = 0;  
-volatile uint32_t fe_count = 0;           
+volatile uint32_t fe_count = 0;   
+volatile uint32_t tc_count = 0;
+volatile uint32_t ht_count = 0;
+volatile uint32_t dma_err_count = 0;     
 uint32_t packets_ok = 0;                  
 uint32_t crc_fail_count = 0;
+
 uint32_t SystemCoreClock = 16000000;     // HSI after reset; set to 100 MHz 
 void SystemInit(void) { }
 uint8_t crc_table[256];
+uint8_t rx_buf [512];
 
 void crc8_init(void){
  for (int i = 0; i<256;i++){
@@ -66,7 +74,7 @@ uint8_t crc8(const uint8_t *data, int len)
     }
     return crc;
 }
-
+//ADD BYTE TO BUFFER
 int rb_put( uint8_t b) {
     uint32_t next = (head + 1) & RB_MASK;
     if (next == tail) {
@@ -76,6 +84,7 @@ int rb_put( uint8_t b) {
     head = next;        
     return 1;
 }
+//DELETE FROM BUFFER    
 int rb_get( uint8_t *out) {
     if (head == tail) {
         return 0;                     
@@ -121,6 +130,27 @@ void delay_us(uint32_t us)
   while((DWT -> CYCCNT-start)<cycles);
 }
 
+
+void dma_init(void){
+RCC->AHB1ENR |= (1u << 22);
+(void)RCC->AHB1ENR;  
+DMA2_Stream2->CR &= ~(1u<< 0);
+while(DMA2_Stream2->CR &(1u<< 0) ){};
+//reset falg those not  need RWM
+DMA2->LIFCR = (1u << 16) | (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21);
+DMA2_Stream2->PAR  =(uint32_t) &USART1->DR ;   
+DMA2_Stream2->M0AR =(uint32_t)rx_buf;  
+DMA2_Stream2->NDTR = 512;
+DMA2_Stream2->CR = (4u << 25)     
+                 | (1u << 10)    
+                 | (1u << 8)      
+                 | (1u << 4) 
+                 | (1u << 3)  
+                 | (1u << 2) ;
+NVIC_SetPriority(DMA2_Stream2_IRQn,1);
+NVIC_EnableIRQ(DMA2_Stream2_IRQn); 
+DMA2_Stream2->CR |= (1u << 0);
+}
 /* ==================== Phase 2.3: starvation experiment ==================== */
 
 #define TEST_SECONDS 5u
@@ -157,6 +187,7 @@ static uint32_t cur_test = 0;
 static uint32_t test_start;
 static uint32_t last_load;
 static uint32_t snap_ok, snap_crc, snap_ore, snap_fe, snap_ovf;
+static uint32_t snap_tc, snap_ht, snap_err;
 
 static void start_test(uint32_t i) {
     const test_t *t = &tests[i];
@@ -173,19 +204,27 @@ static void start_test(uint32_t i) {
     snap_ore = ore_count;
     snap_fe  = fe_count;
     snap_ovf = rb_overflow_count;
-
+    snap_tc  = tc_count;
+    snap_ht  = ht_count;
+    snap_err = dma_err_count;
     test_start = DWT->CYCCNT;
     last_load  = test_start;
 }
 
 static void end_test(uint32_t i) {
-    printf("%-22s pkt/s=%3lu crc/s=%3lu ore/s=%3lu fe=%lu ovf=%lu\n",
+   printf("%-22s pkt/s=%3lu crc/s=%3lu ore/s=%3lu fe=%lu ovf=%lu tc=%lu ht=%lu err=%lu\n",
            tests[i].name,
            (unsigned long)((packets_ok        - snap_ok)  / TEST_SECONDS),
            (unsigned long)((crc_fail_count    - snap_crc) / TEST_SECONDS),
            (unsigned long)((ore_count         - snap_ore) / TEST_SECONDS),
            (unsigned long)(fe_count           - snap_fe),
-           (unsigned long)(rb_overflow_count  - snap_ovf));
+           (unsigned long)(rb_overflow_count  - snap_ovf),
+           (unsigned long)(tc_count           - snap_tc),
+           (unsigned long)(ht_count           - snap_ht),
+           (unsigned long)(dma_err_count      - snap_err));
+   printf("  NDTR=%lu LISR=0x%08lX\n",
+           (unsigned long)DMA2_Stream2->NDTR,
+           (unsigned long)DMA2->LISR);
 }
 
 static void background(void) {
@@ -218,6 +257,24 @@ uint8_t rb_getc(void) {
         background();
     }
     return b;
+}
+
+
+
+void DMA2_Stream2_IRQHandler(void) {
+      
+     if (DMA2->LISR & (1U << 20) ) {          
+          DMA2->LIFCR = (1U << 20);            
+        ht_count ++ ;          
+    }
+      if (DMA2->LISR & (1U << 21) ) {          
+          DMA2->LIFCR = (1U << 21);            
+        tc_count ++ ;          
+    }
+      if (DMA2->LISR & (1U << 19) ) {          
+          DMA2->LIFCR = (1U << 19);            
+        dma_err_count ++ ;          
+    }
 }
 int main(void) {
     //**start with PINS**//
@@ -327,13 +384,14 @@ int main(void) {
     
 crc8_init();
 
-
+    
    (void)USART1->SR;                  
     (void)USART1->DR;
+    //CLEAR DR
     NVIC_SetPriority(USART1_IRQn, 1);
-    USART1->CR1 |= USART_CR1_RXNEIE;
-    NVIC_EnableIRQ(USART1_IRQn);
-
+    dma_init();
+  
+    USART1->CR3 |=(1u << 6);
     printf("starvation test: %u s per row\n", (unsigned)TEST_SECONDS);
     start_test(0);
 
