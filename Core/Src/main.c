@@ -37,14 +37,17 @@ volatile uint32_t head = 0;
 volatile uint32_t tail = 0;
 volatile uint32_t ore_count = 0;          
 volatile uint32_t rb_overflow_count = 0;  
-volatile uint32_t fe_count = 0;   
+volatile uint32_t fe_count = 0; 
+volatile uint32_t dma_written = 0; 
 volatile uint32_t tc_count = 0;
 volatile uint32_t ht_count = 0;
 volatile uint32_t dma_err_count = 0;     
 uint32_t packets_ok = 0;                  
 uint32_t crc_fail_count = 0;
-
+static uint32_t parsed = 0;  
+uint32_t dma_lap_count = 0;  
 uint32_t SystemCoreClock = 16000000;     // HSI after reset; set to 100 MHz 
+
 void SystemInit(void) { }
 uint8_t crc_table[256];
 uint8_t rx_buf [512];
@@ -188,6 +191,7 @@ static uint32_t test_start;
 static uint32_t last_load;
 static uint32_t snap_ok, snap_crc, snap_ore, snap_fe, snap_ovf;
 static uint32_t snap_tc, snap_ht, snap_err;
+static uint32_t snap_lap;
 
 static void start_test(uint32_t i) {
     const test_t *t = &tests[i];
@@ -207,24 +211,20 @@ static void start_test(uint32_t i) {
     snap_tc  = tc_count;
     snap_ht  = ht_count;
     snap_err = dma_err_count;
+    snap_lap = dma_lap_count;
     test_start = DWT->CYCCNT;
     last_load  = test_start;
 }
 
 static void end_test(uint32_t i) {
-   printf("%-22s pkt/s=%3lu crc/s=%3lu ore/s=%3lu fe=%lu ovf=%lu tc=%lu ht=%lu err=%lu\n",
+   printf("%-22s pkt/s=%3lu crc/s=%3lu laps=%lu tc=%lu ht=%lu err=%lu\n",
            tests[i].name,
            (unsigned long)((packets_ok        - snap_ok)  / TEST_SECONDS),
            (unsigned long)((crc_fail_count    - snap_crc) / TEST_SECONDS),
-           (unsigned long)((ore_count         - snap_ore) / TEST_SECONDS),
-           (unsigned long)(fe_count           - snap_fe),
-           (unsigned long)(rb_overflow_count  - snap_ovf),
+           (unsigned long)(dma_lap_count      - snap_lap),
            (unsigned long)(tc_count           - snap_tc),
            (unsigned long)(ht_count           - snap_ht),
            (unsigned long)(dma_err_count      - snap_err));
-   printf("  NDTR=%lu LISR=0x%08lX\n",
-           (unsigned long)DMA2_Stream2->NDTR,
-           (unsigned long)DMA2->LISR);
 }
 
 static void background(void) {
@@ -258,20 +258,34 @@ uint8_t rb_getc(void) {
     }
     return b;
 }
+uint8_t dma_getc(void) {
+    while (parsed == dma_written) {
+        background();
+    }
 
+    if ((dma_written - parsed) > 512) {
+        dma_lap_count++;
+        parsed = dma_written - 512;     
+    }
+    uint8_t b = rx_buf[parsed & 511];
+    parsed++;
+    return b;
+}
 
 
 void DMA2_Stream2_IRQHandler(void) {
-      
-     if (DMA2->LISR & (1U << 20) ) {          
-          DMA2->LIFCR = (1U << 20);            
+      uint32_t isr = DMA2->LISR;
+     if (isr & (1U << 20) ) {          
+          DMA2->LIFCR = (1U << 20); 
+        dma_written += 256 ;       
         ht_count ++ ;          
     }
-      if (DMA2->LISR & (1U << 21) ) {          
-          DMA2->LIFCR = (1U << 21);            
+      if (isr& (1U << 21) ) {          
+          DMA2->LIFCR = (1U << 21); 
+          dma_written += 256 ;            
         tc_count ++ ;          
     }
-      if (DMA2->LISR & (1U << 19) ) {          
+      if (isr & (1U << 19) ) {          
           DMA2->LIFCR = (1U << 19);            
         dma_err_count ++ ;          
     }
@@ -399,14 +413,14 @@ while (1) {
     uint8_t pkt[47];
   
 
-    if (rb_getc() != 0x54) continue;
-    if (rb_getc() != 0x2C) continue;
+    if (dma_getc() != 0x54) continue;
+    if (dma_getc() != 0x2C) continue;
     pkt[0] = 0x54;
     pkt[1] = 0x2C;
 
     //
     for (int i = 2; i < 47; i++)
-        pkt[i] = rb_getc();
+        pkt[i] = dma_getc();
 
     // 
     if (crc8(pkt, 46) != pkt[46]) {
