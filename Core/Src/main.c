@@ -28,6 +28,7 @@
       */
     
 #define RB_SIZE 256u
+#define DROP_TEST 1
 #define RB_MASK (RB_SIZE - 1u)
 #include "stm32f411xe.h"
 #include <stdio.h>
@@ -275,7 +276,14 @@ uint8_t dma_getc(void) {
         parsed = dma_written - 512;     
     }
     uint8_t b = rx_buf[parsed & 511];
-    parsed++;
+     parsed++;
+    #if DROP_TEST
+    static uint32_t last_drop;
+    if ((DWT->CYCCNT - last_drop) >= 1000000u) {   
+        last_drop = DWT->CYCCNT;
+        parsed++;                                 
+    }
+    #endif
     return b;
 }
 
@@ -438,13 +446,18 @@ void parser_feed(uint8_t b){
             state = WAIT_54;
         }
         break;
-     case COLLECT:
+       case COLLECT:
           pkt[idx++] = b;
           if (idx == 47) {
-            if (crc8(pkt, 46) == pkt[46]) packets_ok++;
-            else                          crc_fail_count++;
             idx = 0;
             state = WAIT_54;
+            if (crc8(pkt, 46) == pkt[46]) {packets_ok++;}
+            else{
+            crc_fail_count++;
+                uint8_t replay[46];
+                for (int i = 0; i < 46; i++) replay[i] = pkt[i + 1];
+                for (int i = 0; i < 46; i++) parser_feed(replay[i]);
+            }
         }
         break;
    
@@ -452,6 +465,25 @@ void parser_feed(uint8_t b){
     }
 
 }
+
+void compute_angles(uint32_t start, uint32_t end, uint32_t angle[12]) {
+    if(end < start){
+        end += 36000;
+        
+    }
+    uint32_t span = end - start;
+    for(int i = 0; i < 12; i++){
+          angle[i] = (start + span * i / 11) % 36000;
+    }
+}
+    uint32_t a[12];
+    compute_angles(119, 905, a);
+    printf("normal: first=%lu third=%lu last=%lu\n",
+           (unsigned long)a[0], (unsigned long)a[2], (unsigned long)a[11]);
+    compute_angles(35800, 600, a);
+    printf("wrap:   first=%lu mid=%lu last=%lu\n",
+           (unsigned long)a[0], (unsigned long)a[3], (unsigned long)a[11]);
+ start_test(0);
 while (1) {
       parser_feed(dma_getc());
 }
