@@ -92,6 +92,7 @@ int rb_put( uint8_t b) {
         return 0;         
     }
     buf[head] = b;         
+    __DMB();                       // 4.5: data must be stored before head is published
     head = next;        
     return 1;
 }
@@ -100,7 +101,9 @@ int rb_get( uint8_t *out) {
     if (head == tail) {
         return 0;                     
     }
+    __DMB();                       // 4.5: don't read buf[] before seeing head
     *out = buf[tail];                  
+    __DMB();                       // 4.5: finish the read before releasing the slot
     tail = (tail + 1) & RB_MASK;       
     return 1;
 }
@@ -140,13 +143,31 @@ void delay_us(uint32_t us)
   uint32_t start = DWT -> CYCCNT;
   while((DWT -> CYCCNT-start)<cycles);
 }
+#define WAIT_LOOPS 1000000u      
+uint32_t init_errors = 0;
 
+static int wait_set(volatile uint32_t *reg, uint32_t mask) {
+    for (uint32_t n = 0; n < WAIT_LOOPS; n++) {
+        if (*reg & mask) return 1;
+    }
+    init_errors++;
+    return 0;
+}
+
+
+static int wait_clear(volatile uint32_t *reg, uint32_t mask) {
+    for (uint32_t n = 0; n < WAIT_LOOPS; n++) {
+        if (!(*reg & mask)) return 1;
+    }
+    init_errors++;
+    return 0;
+}
 
 void dma_init(void){
 RCC->AHB1ENR |= (1u << 22);
 (void)RCC->AHB1ENR;  
 DMA2_Stream2->CR &= ~(1u<< 0);
-while(DMA2_Stream2->CR &(1u<< 0) ){};
+wait_clear(&DMA2_Stream2->CR, 1u << 0);   // 4.4: no endless wait
 //reset falg those not  need RWM
 DMA2->LIFCR = (1u << 16) | (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21);
 DMA2_Stream2->PAR  =(uint32_t) &USART1->DR ;   
@@ -266,10 +287,33 @@ uint8_t rb_getc(void) {
     }
     return b;
 }
+/* 4.4: never hang */
+uint32_t no_data_count = 0;
+uint32_t dma_restart_count = 0;
+
+/* TE switches the stream off by itself; re-arm it from scratch.
+   Only safe because the stream is OFF, so its ISR can't touch dma_written now. */
+static void dma_restart(void) {
+    dma_restart_count++;
+    parsed = 0;
+    dma_written = 0;
+    dma_init();
+}
+
 uint8_t dma_getc(void) {
+    uint32_t wait_start = DWT->CYCCNT;
     while (parsed == dma_written) {
         background();
+        if (!(DMA2_Stream2->CR & (1u << 0))) {          // 4.4: EN dropped -> transfer error
+            dma_restart();
+        }
+        if ((DWT->CYCCNT - wait_start) >= ONE_SEC) {   // 4.4: 1 s with no bytes
+            wait_start += ONE_SEC;
+            no_data_count++;
+            printf("no data from sensor (%lu s)\n", (unsigned long)no_data_count);
+        }
     }
+    __DMB();                       // 4.5: read rx_buf only after seeing dma_written
 
     if ((dma_written - parsed) > 512) {
         dma_lap_count++;
@@ -279,7 +323,7 @@ uint8_t dma_getc(void) {
      parsed++;
     #if DROP_TEST
     static uint32_t last_drop;
-    if ((DWT->CYCCNT - last_drop) >= 1000000u) {   
+    if ((DWT->CYCCNT - last_drop) >= 1000000u && parsed != dma_written) {   
         last_drop = DWT->CYCCNT;
         parsed++;                                 
     }
@@ -305,6 +349,11 @@ void DMA2_Stream2_IRQHandler(void) {
         dma_err_count ++ ;          
     }
 }
+/* 4.4: a fault resets the board instead of looping forever */
+void HardFault_Handler(void) {
+    NVIC_SystemReset();
+}
+
 int main(void) {
     //**start with PINS**//
     //wakes up Port A so we can use it
@@ -343,10 +392,13 @@ int main(void) {
     //Turns OFF (HSE) clock,Waits to confirm the HSE is off,Turns on Bypass Mode , 
     // waits confirms the new external clock heartbeat is stable
     RCC->CR &=  ~RCC_CR_HSEON;
-    while (RCC->CR & RCC_CR_HSERDY);
+    wait_clear(&RCC->CR, RCC_CR_HSERDY);
     RCC->CR |= RCC_CR_HSEBYP;
     RCC->CR |=  RCC_CR_HSEON;
-    while (!(RCC->CR & RCC_CR_HSERDY));
+    int hse_ok = wait_set(&RCC->CR, RCC_CR_HSERDY);   // 4.4: no endless wait
+    if (!hse_ok) {
+        RCC->CR &= ~RCC_CR_HSEON;   // 4.4: no 8 MHz from ST-LINK -> fall back to HSI 16 MHz
+    }
     // FOR SAFE 100mhz SPEED UP ,Waking up the Power Controller,
     //Internal voltage regulator ,provide maximum voltage SO CPU core doesn't crash later
     RCC->APB1ENR |= RCC_APB1ENR_PWREN;
@@ -358,23 +410,31 @@ int main(void) {
     FLASH->ACR &= ~FLASH_ACR_LATENCY;
     FLASH->ACR |= FLASH_ACR_LATENCY_3WS;
     FLASH->ACR |= (FLASH_ACR_PRFTEN | FLASH_ACR_ICEN | FLASH_ACR_DCEN);
-    while ((FLASH->ACR & FLASH_ACR_LATENCY) != FLASH_ACR_LATENCY_3WS);
+    for (uint32_t n = 0; n < WAIT_LOOPS &&
+         (FLASH->ACR & FLASH_ACR_LATENCY) != FLASH_ACR_LATENCY_3WS; n++) { }   // 4.4
     //this clears out M N P 
     RCC->PLLCFGR &= ~(RCC_PLLCFGR_PLLM | 
                   RCC_PLLCFGR_PLLN | 
                   RCC_PLLCFGR_PLLP | 
                   RCC_PLLCFGR_PLLSRC);
     //plug clock source and set exactly 100 MHz.
+    if (hse_ok) {
     RCC->PLLCFGR |= RCC_PLLCFGR_PLLSRC_HSE |
                 (4U   << RCC_PLLCFGR_PLLM_Pos) |
                 (100U << RCC_PLLCFGR_PLLN_Pos) |
                 (0U   << RCC_PLLCFGR_PLLP_Pos);   // P = /2 (encoded 00)
+    } else {                                      // 4.4: HSI 16 MHz / 8 = 2 MHz, same 100 MHz out
+    RCC->PLLCFGR |= RCC_PLLCFGR_PLLSRC_HSI |
+                (8U   << RCC_PLLCFGR_PLLM_Pos) |
+                (100U << RCC_PLLCFGR_PLLN_Pos) |
+                (0U   << RCC_PLLCFGR_PLLP_Pos);
+    }
     //PLL engine ON ,wait for PLLRDY,pauses your program until the hardware confirms the clock is completely stable
     //PLL engine - takes a slow heartbeat from the outside and makes it fast on the inside.
     //pauses the program until the chip confirms the internal voltage has safely reached that maximum level
     RCC->CR |= RCC_CR_PLLON;
-    while (!(RCC->CR & RCC_CR_PLLRDY));
-    while (!(PWR->CSR & PWR_CSR_VOSRDY));
+    wait_set(&RCC->CR, RCC_CR_PLLRDY);     // 4.4
+    wait_set(&PWR->CSR, PWR_CSR_VOSRDY);   // 4.4
     //wipe the old settings completely clean on APB1 and APB2 
     //Take 100 MHz CPU speed, divide it by 2, and send a safe 50 MHz to APB1
     RCC->CFGR &= ~(RCC_CFGR_PPRE1 | RCC_CFGR_PPRE2); 
@@ -383,7 +443,8 @@ int main(void) {
     RCC->CFGR &= ~RCC_CFGR_SW;
     RCC->CFGR |= RCC_CFGR_SW_PLL;
     //wait for flag confirming that the CPU is now successfully running at 100 MHz.
-    while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL);
+    for (uint32_t n = 0; n < WAIT_LOOPS &&
+         (RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL; n++) { }   // 4.4
     //Enable the USART2 clock
     RCC->APB1ENR |=(1u << 17);
     (void)RCC->APB1ENR; 
@@ -409,7 +470,9 @@ int main(void) {
 
       SystemCoreClock = 100000000;
       setvbuf(stdout, NULL, _IONBF, 0);
-      printf("boot\n");  
+      printf("boot clk=%s init_errors=%lu\n", hse_ok ? "HSE" : "HSI", (unsigned long)init_errors);
+      if (RCC->CSR & RCC_CSR_SFTRSTF) printf("last reset: software (fault?)\n");   // 4.4
+      RCC->CSR |= RCC_CSR_RMVF;    // clear reset flags for next time
     
 crc8_init();
 
