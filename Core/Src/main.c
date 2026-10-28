@@ -31,7 +31,11 @@
 #define RB_MASK (RB_SIZE - 1u)
 #include "stm32f411xe.h"
 #include <stdio.h>
-
+    enum  {
+    WAIT_54,  
+    WAIT_2C,
+    COLLECT   
+    };
 uint8_t  buf[RB_SIZE];
 volatile uint32_t head = 0;
 volatile uint32_t tail = 0;
@@ -46,6 +50,9 @@ uint32_t packets_ok = 0;
 uint32_t crc_fail_count = 0;
 static uint32_t parsed = 0;  
 uint32_t dma_lap_count = 0;  
+static uint8_t  state = WAIT_54;   
+static uint32_t idx   = 0;         
+static uint8_t  pkt[47];
 uint32_t SystemCoreClock = 16000000;     // HSI after reset; set to 100 MHz 
 
 void SystemInit(void) { }
@@ -408,25 +415,44 @@ crc8_init();
     USART1->CR3 |=(1u << 6);
     printf("starvation test: %u s per row\n", (unsigned)TEST_SECONDS);
     start_test(0);
+    
 
-while (1) {
-    uint8_t pkt[47];
-  
 
-    if (dma_getc() != 0x54) continue;
-    if (dma_getc() != 0x2C) continue;
-    pkt[0] = 0x54;
-    pkt[1] = 0x2C;
-
-    //
-    for (int i = 2; i < 47; i++)
-        pkt[i] = dma_getc();
-
-    // 
-    if (crc8(pkt, 46) != pkt[46]) {
-        crc_fail_count++;
-        continue;
+void parser_feed(uint8_t b){
+   
+   switch (state) {
+    case WAIT_54:
+         if (b == 0x54){
+            pkt[0] = b;
+              state = WAIT_2C;
+         }
+        break;
+    case WAIT_2C:
+           if (b == 0x2C){
+            pkt[1] = b;
+            idx = 2;
+            state = COLLECT;
+         }else if (b == 0x54) {
+             pkt[0] = b; 
+         }else {
+            state = WAIT_54;
+        }
+        break;
+     case COLLECT:
+          pkt[idx++] = b;
+          if (idx == 47) {
+            if (crc8(pkt, 46) == pkt[46]) packets_ok++;
+            else                          crc_fail_count++;
+            idx = 0;
+            state = WAIT_54;
+        }
+        break;
+   
+      
     }
-    packets_ok++;
+
+}
+while (1) {
+      parser_feed(dma_getc());
 }
 }
