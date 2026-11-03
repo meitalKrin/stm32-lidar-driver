@@ -28,7 +28,7 @@
       */
     
 #define RB_SIZE 256u
-#define DROP_TEST 1
+#define DROP_TEST 0
 #define RB_MASK (RB_SIZE - 1u)
 #include "stm32f411xe.h"
 #include <stdio.h>
@@ -51,6 +51,14 @@ uint32_t packets_ok = 0;
 uint32_t crc_fail_count = 0;
 static uint32_t parsed = 0;  
 uint32_t dma_lap_count = 0;  
+/* Phase 5 measurements */
+volatile uint32_t isr_min = 0xFFFFFFFF;   // 5.1: ISR writes, main reads -> volatile
+volatile uint32_t isr_max = 0;
+volatile uint32_t isr_sum = 0;
+volatile uint32_t isr_n   = 0;
+uint32_t buf_hwm = 0;                     // 5.4: most unread bytes ever seen (main only)
+uint32_t no_data_count = 0;               // 4.4
+uint32_t dma_restart_count = 0;           // 4.4
 static uint8_t  state = WAIT_54;   
 static uint32_t idx   = 0;         
 static uint8_t  pkt[47];
@@ -185,7 +193,7 @@ DMA2_Stream2->CR |= (1u << 0);
 }
 /* ==================== Phase 2.3: starvation experiment ==================== */
 
-#define TEST_SECONDS 5u
+#define TEST_SECONDS 10u                 // Phase 5: one long baseline row
 static const uint32_t ONE_SEC = 100000000u;     // cycles at 100 MHz
 
 enum { LOAD_NONE = 0, LOAD_IRQ_OFF = 1, LOAD_SYSTICK = 2 };
@@ -199,6 +207,7 @@ typedef struct {
 
 static const test_t tests[] = {
     { "baseline",            LOAD_NONE,      0,  0 },
+    /* Phase 5: measure the normal case only. Uncomment for the 2.3 / 3.4 sweep.
     { "irq-off 200us / 20ms", LOAD_IRQ_OFF, 200, 20 },
     { "irq-off 200us / 10ms", LOAD_IRQ_OFF, 200, 10 },
     { "irq-off 200us /  5ms", LOAD_IRQ_OFF, 200,  5 },
@@ -206,6 +215,7 @@ static const test_t tests[] = {
     { "irq-off  30us /  2ms", LOAD_IRQ_OFF,  30,  2 },
     { "systick 100us /  1ms", LOAD_SYSTICK, 100,  1 },
     { "systick  30us /  1ms", LOAD_SYSTICK,  30,  1 },
+    */
 };
 #define N_TESTS (sizeof(tests) / sizeof(tests[0]))
 
@@ -221,6 +231,7 @@ static uint32_t last_load;
 static uint32_t snap_ok, snap_crc, snap_ore, snap_fe, snap_ovf;
 static uint32_t snap_tc, snap_ht, snap_err;
 static uint32_t snap_lap;
+static uint32_t snap_isr_sum, snap_isr_n;   // Phase 5
 
 static void start_test(uint32_t i) {
     const test_t *t = &tests[i];
@@ -241,6 +252,13 @@ static void start_test(uint32_t i) {
     snap_ht  = ht_count;
     snap_err = dma_err_count;
     snap_lap = dma_lap_count;
+    __disable_irq();                            // 5.1: ISR also writes these
+    isr_min = 0xFFFFFFFF;
+    isr_max = 0;
+    snap_isr_sum = isr_sum;
+    snap_isr_n   = isr_n;
+    __enable_irq();
+    buf_hwm = 0;
     test_start = DWT->CYCCNT;
     last_load  = test_start;
 }
@@ -254,6 +272,28 @@ static void end_test(uint32_t i) {
            (unsigned long)(tc_count           - snap_tc),
            (unsigned long)(ht_count           - snap_ht),
            (unsigned long)(dma_err_count      - snap_err));
+
+   /* ---- Phase 5 report ---- */
+   __disable_irq();                             // copy ISR stats in one consistent snapshot
+   uint32_t mn = isr_min, mx = isr_max;
+   uint32_t sum = isr_sum - snap_isr_sum, n = isr_n - snap_isr_n;
+   __enable_irq();
+   uint32_t avg = n ? sum / n : 0;
+   /* CPU share = ISR cycles / all cycles in the test. x100000 -> percent with 3 decimals */
+   uint32_t cpu_mpct = (uint32_t)(((uint64_t)sum * 100000u) / ((uint64_t)TEST_SECONDS * ONE_SEC));
+
+   printf("5.1 ISR cycles: min=%lu max=%lu avg=%lu (avg %lu ns) n=%lu (%lu/s)\n",
+          (unsigned long)(n ? mn : 0), (unsigned long)mx, (unsigned long)avg,
+          (unsigned long)(avg * 10u), (unsigned long)n, (unsigned long)(n / TEST_SECONDS));
+   printf("5.2 throughput: %lu pkt/s\n",
+          (unsigned long)((packets_ok - snap_ok) / TEST_SECONDS));
+   printf("5.3 errors: crc=%lu laps=%lu dma_err=%lu restarts=%lu no_data=%lu init_errors=%lu\n",
+          (unsigned long)(crc_fail_count - snap_crc), (unsigned long)(dma_lap_count - snap_lap),
+          (unsigned long)(dma_err_count - snap_err), (unsigned long)dma_restart_count,
+          (unsigned long)no_data_count, (unsigned long)init_errors);
+   printf("5.4 buffer high-water: %lu / 512 bytes\n", (unsigned long)buf_hwm);
+   printf("5.5 CPU in ISR: %lu.%03lu %%\n",
+          (unsigned long)(cpu_mpct / 1000u), (unsigned long)(cpu_mpct % 1000u));
 }
 
 static void background(void) {
@@ -287,9 +327,7 @@ uint8_t rb_getc(void) {
     }
     return b;
 }
-/* 4.4: never hang */
-uint32_t no_data_count = 0;
-uint32_t dma_restart_count = 0;
+/* 4.4: never hang (counters are defined at the top, next to the Phase 5 ones) */
 
 /* TE switches the stream off by itself; re-arm it from scratch.
    Only safe because the stream is OFF, so its ISR can't touch dma_written now. */
@@ -314,6 +352,8 @@ uint8_t dma_getc(void) {
         }
     }
     __DMB();                       // 4.5: read rx_buf only after seeing dma_written
+    uint32_t pending = dma_written - parsed;     // 5.4: how full is the buffer right now
+    if (pending > buf_hwm) buf_hwm = pending;
 
     if ((dma_written - parsed) > 512) {
         dma_lap_count++;
@@ -333,6 +373,7 @@ uint8_t dma_getc(void) {
 
 
 void DMA2_Stream2_IRQHandler(void) {
+      uint32_t t0 = DWT->CYCCNT;              // 5.1: start timing
       uint32_t isr = DMA2->LISR;
      if (isr & (1U << 20) ) {          
           DMA2->LIFCR = (1U << 20); 
@@ -348,6 +389,11 @@ void DMA2_Stream2_IRQHandler(void) {
           DMA2->LIFCR = (1U << 19);            
         dma_err_count ++ ;          
     }
+      uint32_t dt = DWT->CYCCNT - t0;         // 5.1: cycles spent in here
+      if (dt < isr_min) isr_min = dt;         // new shortest?
+      if (dt > isr_max) isr_max = dt;         // new longest?
+      isr_sum += dt;                          // total, for the average
+      isr_n++;                                // how many times
 }
 /* 4.4: a fault resets the board instead of looping forever */
 void HardFault_Handler(void) {
